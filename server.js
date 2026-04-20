@@ -1,4 +1,16 @@
-express    from 'express';
+/**
+ * EarnApp — Secure Server (Hardened)
+ *
+ * Key additions over the original:
+ *  1. AdMob Server-Side Verification (SSV) callback endpoint
+ *  2. HMAC-signed reward tokens so /api/reward can't be called without a real SSV
+ *  3. auth_date expiry check (reject stale Telegram initData)
+ *  4. Per-user in-memory fast-reward detection + DB suspicious_log table
+ *  5. Stricter IP + per-user rate limiting on the reward path
+ *  6. Strict CORS — no wildcard in production
+ */
+
+import express    from 'express';
 import cors       from 'cors';
 import helmet     from 'helmet';
 import rateLimit  from 'express-rate-limit';
@@ -36,7 +48,7 @@ const DAILY_LIMIT       = parseInt(process.env.DAILY_LIMIT  || '50');
 const PTS_PER_AD        = parseInt(process.env.PTS_PER_AD   || '1');
 const ALLOWED_ORIGIN    = process.env.ALLOWED_ORIGIN    || '';   // must be set in prod
 const INITDATA_MAX_AGE  = parseInt(process.env.INITDATA_MAX_AGE || '86400'); // 24 h
-const ADMIN_CHAT_ID     = process.env.ADMIN_CHAT_ID     || '';   // Chat ID of the admin — REQUIRED for withdrawal notifications
+const ADMIN_CHAT_ID     = process.env.ADMIN_CHAT_ID     || '';   // Chat ID of the admin
 
 // Fail fast on missing secrets
 for (const [k, v] of [
@@ -74,10 +86,656 @@ db.exec(`
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     telegram_id    TEXT    NOT NULL,
     pts            INTEGER NOT NULL,
-    ssv_token_hash TEXT,                          -- SHA-256 of the used SSV token (deduplication)
+    ssv_token_hash TEXT,
     rewarded_at    TEXT    NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
   );
 
   CREATE TABLE IF NOT EXISTS suspicious_log (
-    id            INTEGER PRIMARY KEY
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_id   TEXT,
+    ip            TEXT,
+    reason        TEXT    NOT NULL,
+    detail        TEXT,
+    logged_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_reward_log_token
+    ON reward_log(ssv_token_hash)
+    WHERE ssv_token_hash IS NOT NULL;
+`);
+
+const stmts = {
+  getUser:    db.prepare('SELECT * FROM users WHERE telegram_id = ?'),
+  upsertUser: db.prepare(`
+    INSERT INTO users (telegram_id, username, first_name)
+    VALUES (@telegram_id, @username, @first_name)
+    ON CONFLICT(telegram_id) DO UPDATE SET
+      username   = excluded.username,
+      first_name = excluded.first_name
+  `),
+  addReward: db.prepare(`
+    UPDATE users
+    SET balance     = balance + @pts,
+        ads_watched = ads_watched + 1,
+        pts_today   = CASE WHEN last_date = @today THEN pts_today + @pts ELSE @pts END,
+        last_date   = @today,
+        last_reward = @now
+    WHERE telegram_id = @telegram_id
+  `),
+  logReward: db.prepare(`
+    INSERT INTO reward_log (telegram_id, pts, ssv_token_hash)
+    VALUES (@telegram_id, @pts, @ssv_token_hash)
+  `),
+  logSuspicious: db.prepare(`
+    INSERT INTO suspicious_log (telegram_id, ip, reason, detail)
+    VALUES (@telegram_id, @ip, @reason, @detail)
+  `),
+  tokenUsed: db.prepare(
+    'SELECT id FROM reward_log WHERE ssv_token_hash = ?'
+  ),
+};
+
+const rewardTx = db.transaction((telegram_id, pts, today, now, tokenHash) => {
+  stmts.addReward.run({ telegram_id, pts, today, now });
+  stmts.logReward.run({ telegram_id, pts, ssv_token_hash: tokenHash });
+});
+
+// ── Withdrawal statements (from withdrawal module) ──
+const wStmts = initWithdrawalSchema(db);
+
+// ════════════════════════════════════════
+// AdMob SSV KEY CACHE
+// ════════════════════════════════════════
+let admobKeys        = null;
+let admobKeysFetched = 0;
+
+async function getAdmobKeys() {
+  if (admobKeys && Date.now() - admobKeysFetched < 3_600_000) return admobKeys;
+  const res  = await fetch(ADMOB_SSV_KEY_URL);
+  const json = await res.json();
+  admobKeys = new Map(
+    (json.keys || []).map(k => [String(k.keyId), k.pem])
+  );
+  admobKeysFetched = Date.now();
+  return admobKeys;
+}
+
+// ════════════════════════════════════════
+// HMAC REWARD TOKEN HELPERS
+// ════════════════════════════════════════
+const HMAC_KEY  = Buffer.from(REWARD_HMAC_KEY, 'hex');
+const TOKEN_TTL = 120_000;
+
+function issueRewardToken(telegramId, amount, nonce) {
+  const payload = JSON.stringify({
+    tid: telegramId,
+    amt: amount,
+    nonce,
+    exp: Date.now() + TOKEN_TTL,
+  });
+  const sig = crypto.createHmac('sha256', HMAC_KEY).update(payload).digest('hex');
+  return Buffer.from(payload).toString('base64url') + '.' + sig;
+}
+
+function verifyRewardToken(token) {
+  try {
+    const [b64, sig] = token.split('.');
+    if (!b64 || !sig) return null;
+
+    const expectedSig = crypto.createHmac('sha256', HMAC_KEY)
+      .update(Buffer.from(b64, 'base64url').toString())
+      .digest('hex');
+
+    if (!crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expectedSig, 'hex'))) {
+      return null;
+    }
+
+    const payload = JSON.parse(Buffer.from(b64, 'base64url').toString());
+    if (Date.now() > payload.exp) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+// ════════════════════════════════════════
+// EXPRESS APP
+// ════════════════════════════════════════
+const app = express();
+
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc:  ["'self'", 'telegram.org', 'sad.adsgram.ai'],
+      connectSrc: ["'self'"],
+    },
+  },
+}));
+app.use(express.json({ limit: '16kb' }));
+app.use(express.static(path.join(__dirname, '../frontend')));
+
+app.use(cors({
+  origin:  ALLOWED_ORIGIN || '*',
+  methods: ['GET', 'POST'],
+}));
+
+app.use(rateLimit({ windowMs: 60_000, max: 120, standardHeaders: true, legacyHeaders: false }));
+
+const rewardLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 10,
+  message: { error: 'Too many reward requests.' },
+});
+
+const withdrawalLimiter = rateLimit({
+  windowMs: 10 * 60_000,
+  max: 3,
+  message: { error: 'Too many withdrawal requests. Please wait.' },
+  keyGenerator: (req) => {
+    const tid = req.tgUser?.id ? String(req.tgUser.id) : 'unknown';
+    return getIP(req) + ':' + tid;
+  },
+});
+
+// ════════════════════════════════════════
+// PER-USER IN-MEMORY RAPID-REQUEST TRACKER
+// ════════════════════════════════════════
+const recentRewardTimes = new Map();
+const RAPID_WINDOW_MS   = 60_000;
+const RAPID_MAX_CALLS   = 5;
+
+function trackAndCheckRapid(telegramId) {
+  const now   = Date.now();
+  const times = (recentRewardTimes.get(telegramId) || [])
+    .filter(t => now - t < RAPID_WINDOW_MS);
+  times.push(now);
+  recentRewardTimes.set(telegramId, times);
+  return times.length > RAPID_MAX_CALLS;
+}
+
+// ════════════════════════════════════════
+// AUTH MIDDLEWARE
+// ════════════════════════════════════════
+function requireTelegramAuth(req, res, next) {
+  const initData = req.headers['x-telegram-init-data'] || '';
+  if (!initData) return res.status(401).json({ error: 'Missing Telegram auth.' });
+
+  const valid = verifyTelegramInitData(initData, BOT_TOKEN);
+  if (!valid) {
+    flagSuspicious(null, getIP(req), 'INVALID_TELEGRAM_SIG', initData.slice(0, 80));
+    return res.status(403).json({ error: 'Invalid Telegram signature.' });
+  }
+
+  const params   = new URLSearchParams(initData);
+  const authDate = parseInt(params.get('auth_date') || '0', 10);
+  if (!authDate || (Math.floor(Date.now() / 1000) - authDate) > INITDATA_MAX_AGE) {
+    return res.status(403).json({ error: 'Telegram session expired. Please restart the app.' });
+  }
+
+  const user = extractUser(initData);
+  if (!user?.id) return res.status(403).json({ error: 'Could not extract Telegram user.' });
+
+  req.tgUser = user;
+  next();
+}
+
+// ── Pending SSV tokens (in-memory, short-lived) ──────────────────
+const pendingTokens = new Map();
+const PENDING_TTL   = 180_000;
+
+function storePendingToken(nonce, token) {
+  pendingTokens.set(nonce, { token, expires: Date.now() + PENDING_TTL });
+  if (pendingTokens.size > 1000) {
+    for (const [k, v] of pendingTokens) {
+      if (Date.now() > v.expires) pendingTokens.delete(k);
+    }
+  }
+}
+
+function consumePendingToken(nonce) {
+  const entry = pendingTokens.get(nonce);
+  if (!entry || Date.now() > entry.expires) { pendingTokens.delete(nonce); return null; }
+  pendingTokens.delete(nonce);
+  return entry.token;
+}
+
+// ════════════════════════════════════════
+// ROUTES
+// ════════════════════════════════════════
+
+app.get('/api/me', requireTelegramAuth, (req, res) => {
+  const { id, username, first_name } = req.tgUser;
+  const tid = String(id);
+  stmts.upsertUser.run({ telegram_id: tid, username: username || null, first_name: first_name || null });
+  res.json(sanitiseUser(stmts.getUser.get(tid)));
+});
+
+app.get('/api/pending-reward', requireTelegramAuth, (req, res) => {
+  const nonce = req.query.nonce;
+  if (!nonce || typeof nonce !== 'string' || nonce.length > 100) {
+    return res.status(400).json({ error: 'Missing or invalid nonce.' });
+  }
+  const token = consumePendingToken(nonce);
+  if (!token) {
+    return res.status(202).json({ pending: true });
+  }
+  res.json({ reward_token: token });
+});
+
+/**
+ * GET /admob/ssv
+ *
+ * AdMob calls this after the user watches a rewarded ad.
+ *
+ * FIX: The original code declared `telegramId` twice in the same try-block scope:
+ *   - Line 1: const telegramId = custom_data;
+ *   - Line 2: const [telegramId, nonce] = custom_data.split(':');
+ *
+ * Resolution: Remove the first unused declaration entirely.
+ * custom_data has the format "<telegramId>:<nonce>" — we only need the split version.
+ */
+app.get('/admob/ssv', async (req, res) => {
+  try {
+    const q = req.query;
+
+    const { signature, key_id, reward_amount, custom_data, transaction_id } = q;
+    if (!signature || !key_id || !reward_amount || !custom_data || !transaction_id) {
+      return res.status(400).send('Missing required SSV parameters');
+    }
+
+    // ── FIXED: removed the erroneous `const telegramId = custom_data` line.
+    // custom_data format is "<telegramId>:<nonce>" — parse it once here.
+    const [ssvTelegramId, ssvNonce] = custom_data.split(':');
+    if (!ssvTelegramId || !ssvNonce) {
+      return res.status(400).send('Invalid custom_data format. Expected "<telegramId>:<nonce>"');
+    }
+
+    const rawUrl     = req.originalUrl;
+    const sigIdx     = rawUrl.lastIndexOf('&signature=');
+    if (sigIdx === -1) return res.status(400).send('Malformed SSV callback');
+    const signedPart = rawUrl.slice(rawUrl.indexOf('?') + 1, sigIdx);
+
+    const keys   = await getAdmobKeys();
+    const pemKey = keys.get(key_id);
+    if (!pemKey) return res.status(400).send('Unknown key_id');
+
+    const verify = crypto.createVerify('SHA256');
+    verify.update(signedPart);
+    const sigBuf = Buffer.from(
+      signature.replace(/-/g, '+').replace(/_/g, '/'),
+      'base64'
+    );
+    const sigOk = verify.verify(pemKey, sigBuf);
+    if (!sigOk) {
+      flagSuspicious(ssvTelegramId, getIP(req), 'ADMOB_SIG_INVALID', signedPart.slice(0, 100));
+      return res.status(403).send('Invalid AdMob signature');
+    }
+
+    const txHash = sha256(transaction_id);
+    if (stmts.tokenUsed.get(txHash)) {
+      flagSuspicious(ssvTelegramId, getIP(req), 'REPLAYED_TRANSACTION', transaction_id);
+      return res.status(200).send('OK');
+    }
+
+    const rewardToken = issueRewardToken(ssvTelegramId, parseInt(reward_amount, 10), transaction_id);
+    storePendingToken(ssvNonce, rewardToken);
+
+    res.status(200).send('OK');
+
+  } catch (err) {
+    console.error('[SSV] Error:', err);
+    res.status(500).send('SSV processing error');
+  }
+});
+
+app.post('/api/reward', rewardLimiter, requireTelegramAuth, (req, res) => {
+  const tid   = String(req.tgUser.id);
+  const ip    = getIP(req);
+  const now   = Date.now();
+  const today = new Date().toDateString();
+
+  const { reward_token } = req.body || {};
+  if (!reward_token || typeof reward_token !== 'string') {
+    flagSuspicious(tid, ip, 'MISSING_REWARD_TOKEN', 'POST /api/reward without token');
+    return res.status(400).json({ error: 'Missing reward token.' });
+  }
+
+  const tokenPayload = verifyRewardToken(reward_token);
+  if (!tokenPayload) {
+    flagSuspicious(tid, ip, 'INVALID_REWARD_TOKEN', reward_token.slice(0, 40));
+    return res.status(403).json({ error: 'Invalid or expired reward token.' });
+  }
+
+  if (String(tokenPayload.tid) !== tid) {
+    flagSuspicious(tid, ip, 'TOKEN_USER_MISMATCH',
+      `token.tid=${tokenPayload.tid} req.tid=${tid}`);
+    return res.status(403).json({ error: 'Token user mismatch.' });
+  }
+
+  const tokenHash = sha256(reward_token);
+  if (stmts.tokenUsed.get(tokenHash)) {
+    flagSuspicious(tid, ip, 'REPLAYED_REWARD_TOKEN', reward_token.slice(0, 40));
+    return res.status(403).json({ error: 'Reward token already used.' });
+  }
+
+  if (trackAndCheckRapid(tid)) {
+    flagSuspicious(tid, ip, 'RAPID_REWARD_REQUESTS',
+      `>${RAPID_MAX_CALLS} calls in ${RAPID_WINDOW_MS / 1000}s`);
+    return res.status(429).json({ error: 'Unusual activity detected. Please slow down.' });
+  }
+
+  stmts.upsertUser.run({
+    telegram_id: tid,
+    username:    req.tgUser.username   || null,
+    first_name:  req.tgUser.first_name || null,
+  });
+  const user = stmts.getUser.get(tid);
+
+  const elapsed = now - (user.last_reward || 0);
+  if (elapsed < COOLDOWN_MS) {
+    const waitSec = Math.ceil((COOLDOWN_MS - elapsed) / 1000);
+    return res.status(429).json({
+      error:   `Cooldown active. Wait ${waitSec}s.`,
+      wait_ms: COOLDOWN_MS - elapsed,
+    });
+  }
+
+  const ptsToday = user.last_date === today ? user.pts_today : 0;
+  if (ptsToday >= DAILY_LIMIT) {
+    return res.status(429).json({
+      error: `Daily limit of ${DAILY_LIMIT} points reached. Come back tomorrow!`,
+    });
+  }
+
+  const pts = Math.min(tokenPayload.amt, PTS_PER_AD);
+  rewardTx(tid, pts, today, now, tokenHash);
+
+  res.json({ ok: true, user: sanitiseUser(stmts.getUser.get(tid)) });
+});
+
+// ════════════════════════════════════════
+// HELPERS
+// ════════════════════════════════════════
+
+function sanitiseUser(row) {
+  return {
+    balance:     row.balance,
+    ads_watched: row.ads_watched,
+    pts_today:   row.pts_today,
+    last_date:   row.last_date,
+    username:    row.username,
+    first_name:  row.first_name,
+  };
+}
+
+function getIP(req) {
+  return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+}
+
+function sha256(str) {
+  return crypto.createHash('sha256').update(str).digest('hex');
+}
+
+function flagSuspicious(telegramId, ip, reason, detail = '') {
+  console.warn(`[SUSPICIOUS] reason=${reason} tid=${telegramId} ip=${ip} detail=${detail}`);
+  try {
+    stmts.logSuspicious.run({
+      telegram_id: telegramId || null,
+      ip,
+      reason,
+      detail: String(detail).slice(0, 500),
+    });
+  } catch (e) {
+    console.error('[DB] Failed to log suspicious activity:', e.message);
+  }
+}
+
+// ════════════════════════════════════════
+// WITHDRAWAL ROUTES
+// ════════════════════════════════════════
+
+app.get('/api/withdrawal/info', requireTelegramAuth, (req, res) => {
+  const tid  = String(req.tgUser.id);
+  stmts.upsertUser.run({
+    telegram_id: tid,
+    username:    req.tgUser.username   || null,
+    first_name:  req.tgUser.first_name || null,
+  });
+  const user  = stmts.getUser.get(tid);
+  const lastW = wStmts.getLastWithdrawal.get(tid);
+
+  let cooldown_remaining_ms = 0;
+  if (lastW) {
+    const elapsed = Date.now() - new Date(lastW.requested_at + 'Z').getTime();
+    if (elapsed < WITHDRAWAL_COOLDOWN) {
+      cooldown_remaining_ms = WITHDRAWAL_COOLDOWN - elapsed;
+    }
+  }
+
+  res.json({
+    balance:              user.balance,
+    stars_rate:           100,
+    min_points:           MIN_WITHDRAWAL_PTS,
+    max_points:           MAX_WITHDRAWAL_PTS,
+    min_stars:            MIN_STARS,
+    max_stars:            MAX_STARS,
+    cooldown_remaining_ms,
+    last_withdrawal: lastW ? {
+      id:           lastW.id,
+      stars:        lastW.stars_amount,
+      status:       lastW.status,
+      requested_at: lastW.requested_at,
+    } : null,
+    history: wStmts.getUserWithdrawals.all(tid),
+  });
+});
+
+app.post(
+  '/api/withdrawal/request',
+  requireTelegramAuth,
+  withdrawalLimiter,
+  async (req, res) => {
+    const tid = String(req.tgUser.id);
+    const ip  = getIP(req);
+
+    const { points, idempotency_key } = req.body || {};
+
+    if (
+      typeof points !== 'number' ||
+      !Number.isInteger(points) ||
+      points <= 0
+    ) {
+      return res.status(400).json({ error: 'Invalid points value.' });
+    }
+
+    if (
+      !idempotency_key ||
+      typeof idempotency_key !== 'string' ||
+      !/^[0-9a-f-]{36}$/.test(idempotency_key)
+    ) {
+      return res.status(400).json({
+        error: 'Missing or malformed idempotency_key. Must be a UUID v4.',
+      });
+    }
+
+    const keyHash  = sha256(tid + ':' + idempotency_key);
+    const existing = wStmts.getWithdrawalByKey.get(keyHash);
+    if (existing) {
+      return res.json({
+        ok:         true,
+        idempotent: true,
+        withdrawal: {
+          id:     existing.id,
+          stars:  existing.stars_amount,
+          points: existing.points_deducted,
+          status: existing.status,
+        },
+      });
+    }
+
+    stmts.upsertUser.run({
+      telegram_id: tid,
+      username:    req.tgUser.username   || null,
+      first_name:  req.tgUser.first_name || null,
+    });
+    const user = stmts.getUser.get(tid);
+
+    const validation = validateWithdrawal(user, points, wStmts);
+    if (!validation.ok) {
+      flagSuspicious(tid, ip, 'WITHDRAWAL_VALIDATION_FAIL',
+        `pts=${points} bal=${user.balance} err=${validation.error}`);
+      return res.status(validation.code).json({
+        error:   validation.error,
+        wait_ms: validation.wait_ms,
+      });
+    }
+
+    const starsAmount = pointsToStars(points);
+
+    let withdrawalId;
+    try {
+      withdrawalId = createWithdrawalAtomic(
+        db, wStmts, tid, points, starsAmount, keyHash
+      );
+    } catch (err) {
+      console.error('[Withdrawal] Atomic transaction failed:', err.message);
+      flagSuspicious(tid, ip, 'WITHDRAWAL_ATOMIC_FAIL', err.message);
+      return res.status(400).json({ error: err.message });
+    }
+
+    res.status(202).json({
+      ok:            true,
+      withdrawal_id: withdrawalId,
+      stars:         starsAmount,
+      points:        points,
+      status:        'pending',
+      message:       'Withdrawal queued. Stars will arrive shortly.',
+    });
+
+    // Notify admin asynchronously (does not block response)
+    notifyAdmin(BOT_TOKEN, ADMIN_CHAT_ID, {
+      withdrawalId,
+      starsAmount,
+      pointsRequested: points,
+    }, user);
+
+    // Process payout asynchronously
+    processTelegramPayout(withdrawalId, tid, starsAmount, ip);
+  }
+);
+
+app.get('/api/withdrawal/status/:id', requireTelegramAuth, (req, res) => {
+  const tid = String(req.tgUser.id);
+  const id  = parseInt(req.params.id, 10);
+
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: 'Invalid withdrawal ID.' });
+  }
+
+  const withdrawal = wStmts.getWithdrawalById.get(id);
+  if (!withdrawal) {
+    return res.status(404).json({ error: 'Withdrawal not found.' });
+  }
+
+  if (withdrawal.telegram_id !== tid) {
+    flagSuspicious(tid, getIP(req), 'WITHDRAWAL_ID_SNOOPING',
+      `user ${tid} tried to access withdrawal ${id} owned by ${withdrawal.telegram_id}`);
+    return res.status(403).json({ error: 'Access denied.' });
+  }
+
+  res.json({
+    id:             withdrawal.id,
+    stars:          withdrawal.stars_amount,
+    points:         withdrawal.points_deducted,
+    status:         withdrawal.status,
+    requested_at:   withdrawal.requested_at,
+    processed_at:   withdrawal.processed_at,
+    failure_reason: withdrawal.status === 'failed'
+      ? withdrawal.failure_reason : undefined,
+  });
+});
+
+// ── Async Telegram payout processor ──────────────────────────────────────────
+async function processTelegramPayout(withdrawalId, telegramId, starsAmount, ip) {
+  try {
+    console.log(
+      `[Withdrawal] Processing payout #${withdrawalId}: ` +
+      `${starsAmount} Stars → user ${telegramId}`
+    );
+
+    const result = await sendStarsToUser(
+      BOT_TOKEN,
+      parseInt(telegramId, 10),
+      starsAmount,
+      withdrawalId
+    );
+
+    if (result.ok) {
+      wStmts.updateWithdrawalStatus.run({
+        id:             withdrawalId,
+        status:         'completed',
+        tg_payment_id:  result.payment_id || null,
+        failure_reason: null,
+      });
+      console.log(
+        `[Withdrawal] Payout #${withdrawalId} completed via ${result.method}. ` +
+        `payment_id=${result.payment_id}`
+      );
+    } else {
+      db.prepare(
+        'UPDATE users SET balance = balance + ? WHERE telegram_id = ?'
+      ).run(
+        wStmts.getWithdrawalById.get(withdrawalId)?.points_deducted || 0,
+        telegramId
+      );
+      wStmts.updateWithdrawalStatus.run({
+        id:             withdrawalId,
+        status:         'failed',
+        tg_payment_id:  null,
+        failure_reason: result.error || 'Unknown Telegram API error',
+      });
+      console.error(
+        `[Withdrawal] Payout #${withdrawalId} FAILED: ${result.error}. ` +
+        `Points refunded to user ${telegramId}.`
+      );
+      flagSuspicious(
+        telegramId, ip, 'WITHDRAWAL_PAYOUT_FAILED',
+        `id=${withdrawalId} err=${result.error}`
+      );
+    }
+
+  } catch (err) {
+    console.error(`[Withdrawal] Unexpected error for payout #${withdrawalId}:`, err);
+    try {
+      const w = wStmts.getWithdrawalById.get(withdrawalId);
+      if (w && w.status === 'pending') {
+        db.prepare(
+          'UPDATE users SET balance = balance + ? WHERE telegram_id = ?'
+        ).run(w.points_deducted, telegramId);
+        wStmts.updateWithdrawalStatus.run({
+          id:             withdrawalId,
+          status:         'failed',
+          tg_payment_id:  null,
+          failure_reason: err.message,
+        });
+      }
+    } catch (refundErr) {
+      console.error('[Withdrawal] CRITICAL: Could not refund points after failure:', refundErr);
+    }
+  }
+}
+
+// ════════════════════════════════════════
+// ADMIN ROUTES
+// ════════════════════════════════════════
+mountAdminRoutes(app, db, wStmts, sendStarsToUser, BOT_TOKEN);
+
+// ════════════════════════════════════════
+// START
+// ════════════════════════════════════════
+app.listen(PORT, () => {
+  console.log(`[EarnApp] Server on http://localhost:${PORT}`);
+  console.log(`[EarnApp] Daily limit: ${DAILY_LIMIT} pts | Cooldown: ${COOLDOWN_MS}ms`);
+});
